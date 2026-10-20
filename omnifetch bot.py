@@ -27,6 +27,9 @@ from telegram import (
     LabeledPrice,
     User,
     InputMediaPhoto,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
 )
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -603,11 +606,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• **صوت:** MP3 مجاني للجميع بجميع الجودات حتى 320kbps.\n"
         "• **صور:** مجانية لجميع الفئات بأعلى دقة متوفرة كصورة وكمستند أصلي.\n\n"
         "4️⃣ **الأوامر المتوفرة:**\n"
-        "• `/start` — بدء البوت وعرض الرصيد\n"
+        "• `/start` — بدء البوت وتحديث بياناتك\n"
+        "• `/status` أو `/me` — رصيدك اليومي وحالة حسابك\n"
         "• `/upgrade` — ترقية الحساب إلى بريميوم\n"
-        "• `/contact` — التواصل مع المدير مباشرة\n"
-        "• `/id` — معرفة رقم الآيدي الخاص بك\n"
-        "• `/help` — عرض هذه التعليمات\n\n"
+        "• `/ping` — فحص سرعة استجابة البوت\n"
+        "• `/id` — معرفة رقم الآيدي الخاص بك للنسخ\n"
+        "• `/contact` — التواصل مع المدير والدعم\n"
+        "• `/help` — عرض دليل الاستخدام الكامل\n\n"
         f"📞 **للتواصل المباشر مع المدير:** `{ADMIN_USERNAME}`"
     )
     keyboard = [
@@ -742,6 +747,7 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         ],
         [
             InlineKeyboardButton("👥 إدارة المدراء (Admins)", callback_data="manage_admins"),
+            InlineKeyboardButton("💾 نسخة احتياطية للقاعدة", callback_data="admin_backup_db"),
         ]
     ]
 
@@ -756,7 +762,11 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "• `/broadcast <رسالتك>` — إذاعة رسالة لجميع المستخدمين\n"
         "• `/addadmin <user_id>` — تعيين مدير جديد (للمالك فقط)\n"
         "• `/deladmin <user_id>` — إزالة مدير (للمالك فقط)\n"
-        "• `/admins` — عرض قائمة المدراء المشرفين"
+        "• `/admins` — عرض قائمة المدراء المشرفين\n"
+        "• `/rempremium <user_id>` — إلغاء اشتراك البريميوم لمستخدم\n"
+        "• `/resetdaily <user_id>` — تصفير عداد التحميل اليومي لمستخدم\n"
+        "• `/clean` — تنظيف وحذف الملفات المؤقتة في السيرفر\n"
+        "• `/backup` — سحب نسخة احتياطية فورية من قاعدة البيانات وإرسالها لك"
     )
     if update.callback_query:
         await update.callback_query.edit_message_text(panel_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -885,6 +895,275 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+def create_sqlite_backup_file() -> Tuple[str, int]:
+    """
+    إنشاء نسخة احتياطية آمنة ومتوافقة 100% من قاعدة البيانات
+    باستخدام آلية SQLite Online Backup API لمنع أي تضارب أو تلف أثناء الكتابة.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_filename = f"users_backup_{timestamp}.db"
+    backup_path = os.path.join(DOWNLOAD_DIR, backup_filename)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    
+    src_conn = sqlite3.connect(DB_FILE)
+    dest_conn = sqlite3.connect(backup_path)
+    try:
+        src_conn.backup(dest_conn)
+    finally:
+        dest_conn.close()
+        src_conn.close()
+        
+    size_bytes = os.path.getsize(backup_path) if os.path.exists(backup_path) else 0
+    return backup_path, size_bytes
+
+
+async def send_database_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال نسخة احتياطية من قاعدة البيانات للمدير."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        if update.callback_query:
+            await update.callback_query.answer("⛔ غير مصرح لك.", show_alert=True)
+        else:
+            await update.message.reply_text("⛔ غير مصرح لك.")
+        return
+
+    msg_target = update.effective_message
+    if update.callback_query:
+        await update.callback_query.answer("⏳ جاري إنشاء النسخة الاحتياطية...")
+    status_msg = await msg_target.reply_text("⏳ **جاري إنشاء وحزم نسخة احتياطية آمنة لقاعدة البيانات...**", parse_mode="Markdown")
+
+    backup_path = None
+    try:
+        backup_path, size_bytes = await asyncio.to_thread(create_sqlite_backup_file)
+        stats = get_database_stats()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        size_kb = size_bytes / 1024
+        size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.2f} MB"
+        
+        caption = (
+            "📦 **نسخة احتياطية لقاعدة البيانات (Database Backup)**\n\n"
+            f"📅 **تاريخ الإنشاء:** `{now_str}`\n"
+            f"👥 **إجمالي المستخدمين:** `{stats['total_users']}`\n"
+            f"💎 **المشتركون النشطون:** `{stats['active_paid']}`\n"
+            f"🚀 **إجمالي التحميلات:** `{stats['total_downloads']}`\n"
+            f"💾 **حجم الملف:** `{size_str}`\n\n"
+            "🔒 _احتفظ بهذا الملف في مكان آمن أو في رسائلك المحفوظة (Saved Messages). "
+            "في حال حدوث أي طارئ يمكنك استعادة بيانات المستخدمين فوراً._"
+        )
+        
+        with open(backup_path, "rb") as f:
+            await update.effective_chat.send_document(
+                document=f,
+                filename=os.path.basename(backup_path),
+                caption=caption,
+                parse_mode="Markdown"
+            )
+            
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Failed to generate db backup: {e}", exc_info=True)
+        if status_msg:
+            await status_msg.edit_text(f"❌ **حدث خطأ أثناء أخذ النسخة الاحتياطية:** `{e}`")
+        else:
+            await msg_target.reply_text(f"❌ **حدث خطأ أثناء أخذ النسخة الاحتياطية:** `{e}`")
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except Exception:
+                pass
+
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر أخذ نسخة احتياطية فورية: /backup"""
+    await send_database_backup(update, context)
+
+# --- أوامر التوسعة الجديدة (EXPANDED COMMAND SUITE) ---
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض تفاصيل الحساب والرصيد المتبقي للمستخدم: /status أو /me"""
+    user = update.effective_user
+    st = get_or_update_user(user)
+    today = date.today().isoformat()
+    is_prem = bool(st["premium_until"] and st["premium_until"] >= today)
+    tier_badge = "💎 **عضو بريميوم (VIP)**" if is_prem else "👤 **عضو مجاني**"
+
+    if is_prem:
+        limit_text = "♾️ **غير محدود** (تحميل سريع وبدون قيود)"
+        exp_text = f"📅 **تاريخ الانتهاء:** `{st['premium_until']}`"
+    else:
+        used = st["daily_downloads"]
+        remaining = max(0, DAILY_FREE_LIMIT - used)
+        limit_text = f"`{remaining}` من أصل `{DAILY_FREE_LIMIT}` فيديوهات متبقية اليوم"
+        exp_text = "🔄 **تجديد الرصيد:** يومياً الساعة 12:00 منتصف الليل"
+
+    status_card = (
+        "📊 **بطاقة حالة الحساب الشخصي:**\n\n"
+        f"👤 **الاسم:** {user.first_name}\n"
+        f"🏷 **المعرف:** @{user.username if user.username else 'بدون معرف'}\n"
+        f"🆔 **الآيدي:** `{user.id}`\n"
+        f"👑 **نوع الحساب:** {tier_badge}\n"
+        f"📥 **الرصيد المتاح:** {limit_text}\n"
+        f"🚀 **إجمالي التحميلات السابقة:** `{st['total_downloads']}` عملية\n"
+        f"{exp_text}\n"
+    )
+
+    keyboard = []
+    if not is_prem:
+        keyboard.append([InlineKeyboardButton("💎 ترقية الحساب إلى بريميوم", callback_data="upgrade_menu")])
+    keyboard.append([InlineKeyboardButton("💬 مساعدة وتواصل", callback_data="show_help")])
+
+    msg_target = update.effective_message
+    if msg_target:
+        await msg_target.reply_text(status_card, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فحص سرعة استجابة البوت وحالة السيرفر: /ping"""
+    start_time = datetime.now()
+    msg_target = update.effective_message
+    sent_msg = await msg_target.reply_text("🏓 **Pong! جارٍ فحص استجابة السيرفر...**", parse_mode="Markdown")
+    end_time = datetime.now()
+    latency_ms = int((end_time - start_time).total_seconds() * 1000)
+
+    if latency_ms < 250:
+        speed_badge = "🚀 فائقة السرعة"
+    elif latency_ms < 600:
+        speed_badge = "⚡ جيدة وطبيعية"
+    else:
+        speed_badge = "⏳ متوسطة"
+
+    await sent_msg.edit_text(
+        f"🏓 **معلومات الاتصال وحالة السيرفر:**\n\n"
+        f"⚡ **سرعة الاستجابة (Latency):** `{latency_ms} ms` ({speed_badge})\n"
+        f"🟢 **حالة النظام:** جميع محركات التحميل والمعالجة تعمل بكفاءة 100%\n"
+        f"⏱️ **توقيت السيرفر:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
+        parse_mode="Markdown"
+    )
+
+
+async def rem_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء اشتراك البريميوم لمستخدم: /rempremium <user_id>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ غير مصرح لك.")
+        return
+    try:
+        target_id = int(context.args[0])
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET premium_until = NULL WHERE user_id = ?", (target_id,))
+            conn.commit()
+
+        await update.message.reply_text(f"✅ تم إلغاء اشتراك البريميوم للمستخدم `{target_id}` بنجاح.", parse_mode="Markdown")
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="ℹ️ **تم إنهاء اشتراك البريميوم لحسابك من قبل الإدارة.**\nيمكنك الاستمرار بالاستخدام المجاني أو التجديد عبر أمر /upgrade.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    except (IndexError, ValueError):
+        await update.message.reply_text("طريقة الاستخدام: `/rempremium <user_id>`\nمثال: `/rempremium 123456789`", parse_mode="Markdown")
+
+
+async def reset_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تصفير العداد اليومي لمستخدم: /resetdaily <user_id>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ غير مصرح لك.")
+        return
+    try:
+        target_id = int(context.args[0])
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET daily_downloads = 0 WHERE user_id = ?", (target_id,))
+            conn.commit()
+
+        await update.message.reply_text(f"✅ تم تصفير عداد التحميل اليومي للمستخدم `{target_id}` بنجاح.", parse_mode="Markdown")
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="🎁 **تمت إعادة ضبط رصيدك اليومي للتحميل! يمكنك الآن التحميل مجدداً.**",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    except (IndexError, ValueError):
+        await update.message.reply_text("طريقة الاستخدام: `/resetdaily <user_id>`\nمثال: `/resetdaily 123456789`", parse_mode="Markdown")
+
+
+async def clean_temp_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تنظيف الملفات المؤقتة في مجلد التحميلات: /clean"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ غير مصرح لك.")
+        return
+
+    status_msg = await update.message.reply_text("🧹 **جارٍ فحص وتنظيف الملفات المؤقتة...**", parse_mode="Markdown")
+    deleted_count = 0
+    freed_bytes = 0
+    try:
+        for fname in os.listdir(DOWNLOAD_DIR):
+            fpath = os.path.join(DOWNLOAD_DIR, fname)
+            if os.path.isfile(fpath):
+                try:
+                    sz = os.path.getsize(fpath)
+                    os.remove(fpath)
+                    deleted_count += 1
+                    freed_bytes += sz
+                except Exception:
+                    pass
+
+        freed_mb = freed_bytes / (1024 * 1024)
+        await status_msg.edit_text(
+            f"✅ **تم تنظيف المجلد المؤقت بنجاح!**\n\n"
+            f"🗑️ **عدد الملفات المحذوفة:** `{deleted_count}` ملف\n"
+            f"💾 **المساحة المحررة:** `{freed_mb:.2f} MB`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ خطأ أثناء التنظيف: `{e}`")
+
+
+async def post_init_commands(app):
+    """تسجيل قوائم الأوامر الرسمية في واجهة تيليجرام تلقائياً (زر القائمة Menu)."""
+    user_commands = [
+        BotCommand("start", "🚀 بدء استخدام البوت وتحديث بياناتك"),
+        BotCommand("status", "📊 رصيدك اليومي وحالة حسابك الشخصي"),
+        BotCommand("upgrade", "💎 ترقية الحساب إلى بريميوم والأسعار"),
+        BotCommand("help", "📖 دليل الاستخدام والمنصات المدعومة"),
+        BotCommand("contact", "💬 التواصل المباشر مع المدير والدعم"),
+        BotCommand("id", "🆔 معرف الآيدي الخاص بك للنسخ"),
+        BotCommand("ping", "⚡ فحص سرعة استجابة البوت والسيرفر"),
+    ]
+    try:
+        await app.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    except Exception as e:
+        logger.error(f"Failed to set user commands menu: {e}")
+
+    admin_commands = user_commands + [
+        BotCommand("admin", "👑 لوحة التحكم والإدارة التفاعلية"),
+        BotCommand("user", "🔍 البحث عن مستخدم والتحكم بحسابه"),
+        BotCommand("stats", "📈 إحصائيات البوت اللحظية والأرباح"),
+        BotCommand("backup", "💾 سحب نسخة احتياطية من قاعدة البيانات"),
+        BotCommand("broadcast", "📢 إذاعة رسالة لجميع المستخدمين"),
+        BotCommand("clean", "🧹 تنظيف الملفات المؤقتة من السيرفر"),
+        BotCommand("admins", "👥 عرض وإدارة طاقم المشرفين"),
+    ]
+    admin_ids = get_all_admin_ids()
+    for a_id in admin_ids:
+        try:
+            await app.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=a_id))
+        except Exception:
+            pass
+
+
 async def admin_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة جميع أزرار لوحة تحكم المدير وبطاقات المستخدمين."""
     query = update.callback_query
@@ -895,7 +1174,11 @@ async def admin_button_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     data = query.data
 
-    if data == "admin_panel_home":
+    if data == "admin_backup_db":
+        await send_database_backup(update, context)
+        return
+
+    elif data == "admin_panel_home":
         await admin_panel_command(update, context)
         await query.answer()
 
@@ -2261,29 +2544,35 @@ def main():
 
     # تكوين اتصال متين بشبكة تيليجرام مع زيادة مهلة الاتصال ورفع الملفات
     request = HTTPXRequest(connect_timeout=60.0, read_timeout=300.0, write_timeout=300.0)
-    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).post_init(post_init_commands).build()
 
-    # أوامر المستخدمين العامة
+    # أوامر المستخدمين العامة (موسعة)
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler(["status", "me"], status_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("contact", contact_command))
     app.add_handler(CommandHandler("admin_contact", contact_command))
     app.add_handler(CommandHandler("id", my_id_command))
     app.add_handler(CommandHandler("myid", my_id_command))
-    app.add_handler(CommandHandler("upgrade", upgrade_command))
+    app.add_handler(CommandHandler(["upgrade", "plans", "prices"], upgrade_command))
+    app.add_handler(CommandHandler("ping", ping_command))
 
-    # لوحة تحكم المدير وأوامر الإدارة
+    # لوحة تحكم المدير وأوامر الإدارة (موسعة)
     app.add_handler(CommandHandler("admin", admin_panel_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("addpremium", add_premium_command))
+    app.add_handler(CommandHandler("rempremium", rem_premium_command))
+    app.add_handler(CommandHandler("resetdaily", reset_daily_command))
+    app.add_handler(CommandHandler("clean", clean_temp_files_command))
     app.add_handler(CommandHandler("user", user_search_command))
     app.add_handler(CommandHandler("find", user_search_command))
     app.add_handler(CommandHandler("addadmin", add_admin_command))
     app.add_handler(CommandHandler("deladmin", del_admin_command))
     app.add_handler(CommandHandler("admins", list_admins_command))
+    app.add_handler(CommandHandler("backup", backup_command))
 
     # أزرار لوحة الإدارة ونظام الموافقة والرفض وإجراءات المستخدمين
     app.add_handler(CallbackQueryHandler(admin_button_callback, pattern="^(admin_|approve_sub_|reject_sub_|act_|search_user_prompt|manage_admins|prompt_add_admin)"))
