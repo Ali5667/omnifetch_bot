@@ -2,10 +2,14 @@ import os
 import sys
 import re
 import io
+import json
 import asyncio
 import logging
 import sqlite3
 import threading
+import subprocess
+import urllib.parse
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import date, datetime, timedelta
 from typing import Optional, List, Tuple
@@ -58,6 +62,38 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.svg', '.ico')
 COOKIES_FILE = "cookies.txt"  # ملف كوكيز يوتيوب لتجاوز القيود وتحميل فيديوهات الانتساب
+
+# --- محرك الترجمة واستخراج النصوص للفيديوهات (14 لغة عالمية) ---
+TRANSLATION_LANGUAGES = {
+    "ar": {"name": "العربية (Arabic)", "flag": "🇸🇦", "code": "ar"},
+    "en": {"name": "English (الإنجليزية)", "flag": "🇺🇸", "code": "en"},
+    "ku": {"name": "کوردی (الكردية)", "flag": "☀️", "code": "ku"},
+    "tr": {"name": "Türkçe (التركية)", "flag": "🇹🇷", "code": "tr"},
+    "fa": {"name": "فارسی (الفارسية)", "flag": "🇮🇷", "code": "fa"},
+    "fr": {"name": "Français (الفرنسية)", "flag": "🇫🇷", "code": "fr"},
+    "es": {"name": "Español (الإسبانية)", "flag": "🇪🇸", "code": "es"},
+    "de": {"name": "Deutsch (الألمانية)", "flag": "🇩🇪", "code": "de"},
+    "ru": {"name": "Русский (الروسية)", "flag": "🇷🇺", "code": "ru"},
+    "zh-CN": {"name": "中文 (الصينية)", "flag": "🇨🇳", "code": "zh-CN"},
+    "ja": {"name": "日本語 (اليابانية)", "flag": "🇯🇵", "code": "ja"},
+    "ko": {"name": "한국어 (الكورية)", "flag": "🇰🇷", "code": "ko"},
+    "it": {"name": "Italiano (الإيطالية)", "flag": "🇮🇹", "code": "it"},
+    "pt": {"name": "Português (البرتغالية)", "flag": "🇧🇷", "code": "pt"},
+}
+
+def get_translation_keyboard(include_back: bool = True) -> InlineKeyboardMarkup:
+    """توليد لوحة أزرار تفاعلية تضم الـ 14 لغة ترجمة عالمية المتاحة"""
+    keys = list(TRANSLATION_LANGUAGES.items())
+    rows = []
+    for i in range(0, len(keys), 2):
+        row = []
+        for code, info in keys[i:i+2]:
+            row.append(InlineKeyboardButton(f"{info['flag']} {info['name']}", callback_data=f"tr_lang_{code}"))
+        rows.append(row)
+    if include_back:
+        rows.append([InlineKeyboardButton("🔙 رجوع للقائمة السابقة", callback_data="choose_type_back")])
+    return InlineKeyboardMarkup(rows)
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -362,6 +398,28 @@ def increment_confirmed_download(user_id: int, is_free_tier: bool):
             )
         conn.commit()
 
+# --- رسالة حظر الميزات المدفوعة (PREMIUM GATE) ---
+PREMIUM_GATE_TEXT = (
+    "🔒 **ميزة حصرية لمشتركي باقة البريميوم 💎**\n\n"
+    "هذه الأداة المتقدمة متاحة فقط للمشتركين في الباقة المدفوعة.\n\n"
+    "✨ **مميزات البريميوم الحصرية:**\n"
+    "• 🌐 ترجمة الفيديوهات لـ 14 لغة عالمية (Hardsub + SRT)\n"
+    "• ✂️ قص المقاطع السحابي (Trim) بأي مدة\n"
+    "• 🎞️ صانع GIF المتحرك عالي الجودة\n"
+    "• 📹 دقات العرض العالية (1080p / 2K / 4K)\n"
+    "• ⚡ سرعة معالجة وتحويل فائقة\n"
+    "• ♾️ تحميل غير محدود بدون حد يومي\n\n"
+    "💰 **السعر:** 5.00$ فقط لمدة 30 يوم (أو 250 نجمة تيليجرام)\n\n"
+    "🚀 اضغط الزر أدناه للترقية والاستمتاع بجميع المميزات فوراً!"
+)
+
+def get_premium_gate_keyboard():
+    """إنشاء لوحة أزرار ترقية البريميوم عند محاولة استخدام ميزة مدفوعة."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 ترقية الحساب الآن (بريميوم)", callback_data="upgrade_menu")],
+        [InlineKeyboardButton("💬 تواصل مع المدير للاشتراك", url=ADMIN_URL)],
+    ])
+
 # --- محرك الإحصائيات (ADMIN STATS ENGINE) ---
 def get_database_stats():
     """حساب المقاييس الحية للوحة تحكم المدير."""
@@ -577,11 +635,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     msg = (
-        f"👋 أهلاً بك في **بوت OmniFetch الشامل**!\n\n"
-        f"🎯 **ماذا يمكن للبوت تحميله ومعالجته؟**\n"
-        f"• **فيديوهات:** يوتيوب، تيك توك، إنستغرام، فيسبوك، X (تويتر)، ساوند كلاود.\n"
-        f"• **صوتيات:** استخراج MP3 بنقاوة عالية (320kbps / 192kbps / 128kbps).\n"
-        f"• **صور وألبومات:** تحميل الصور بأي صيغة وتحويلها فوراً (PNG, JPG, WEBP, PDF).\n\n"
+        f"👋 أهلاً بك في **بوت OmniFetch الشامل واستوديو الوسائط الذكي**!\n\n"
+        f"🎯 **الميزات الفريدة والحصرية في البوت:**\n"
+        f"• 🌐 **ترجمة الفيديوهات (14 لغة عالمية):** استخراج الكلام ودمج الترجمة الملونة الاحترافية بالفيديو فورياً (عربي، إنجليزي، كردي، تركي، فارسي، فرنسي، إسباني، ألماني، روسي، صيني، ياباني، كوري، إيطالي، برتغالي).\n"
+        f"• ✂️ **قص المقاطع السحابي (Trim):** تحديد الثواني المطلوبة وتنزيلها مقصوصة فوراً.\n"
+        f"• 🎞️ **صانع الـ GIF:** تحويل أي لقطة فيديو إلى GIF متحرك عالي الجودة.\n"
+        f"• 📹 **تحميل الفيديوهات:** يوتيوب، تيك توك، إنستغرام، فيسبوك، X (تويتر)، بينترست.\n"
+        f"• 🎵 **صوتيات عالية النقاوة:** MP3 (320kbps / 192kbps / 128kbps).\n"
+        f"• 🖼️ **الصور والألبومات:** تنزيل وتحويل فوري (PNG, JPG, WEBP, PDF).\n\n"
         f"{user_id_line}"
         f"{sub_info}\n\n"
         f"💬 **للتواصل مع المدير والدعم:** [{ADMIN_USERNAME}]({ADMIN_URL})"
@@ -595,16 +656,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg_target:
         return
     help_text = (
-        "📖 **دليل استخدام بوت OmniFetch:**\n\n"
-        "1️⃣ **كيفية التحميل:**\n"
-        "فقط أرسل أي رابط فيديو أو صورة أو منشور (تيك توك، إنستغرام، يوتيوب، بينترست، X، فيسبوك).\n\n"
-        "2️⃣ **دعم الصور (لكل الفئات وبأي صيغة):**\n"
-        "• يمكنك إرسال روابط صور أو منشورات إنستغرام/بينترست لتحميلها بأعلى نقاوة.\n"
-        "• يمكنك إرسال أي صورة مباشرة للبوت لتحويلها إلى (PNG, JPG, WEBP, PDF) فوراً!\n\n"
+        "📖 **دليل استخدام واستوديو بوت OmniFetch:**\n\n"
+        "1️⃣ **كيفية التحميل والترجمة:**\n"
+        "أرسل أي رابط فيديو أو صورة. ستظهر لك قائمة فورية تتيح لك:\n"
+        "• 📹 **تحميل الفيديو بدقات متعددة**\n"
+        "• 🌐 **ترجمة الفيديو لـ 14 لغة عالمية** (دمج الترجمة بخط أنيق + الحصول على ملف SRT)\n"
+        "• ✂️ **قص مقطع محدد** بإرسال وقت البداية والنهاية (مثلاً: `00:15 00:45`)\n"
+        "• 🎞️ **تحويل الفيديو إلى GIF متحرك**\n"
+        "• 🎵 **استخراج الصوت بصيغة MP3 عالية النقاوة**\n\n"
+        "2️⃣ **دعم الصور (مجاني للجميع وبأي صيغة):**\n"
+        "• إرسال أي رابط إنستغرام أو بينترست لتحميل الألبوم كاملاً بدقة أصلية.\n"
+        "• إرسال أي صورة مباشرة للبوت لتحويلها إلى (PNG, JPG, WEBP, PDF) فوراً!\n\n"
         "3️⃣ **الجودات والدقات:**\n"
         "• **فيديو:** مجاني حتى 720p، ودقات (1080p, 2K, 4K) للبريميوم.\n"
-        "• **صوت:** MP3 مجاني للجميع بجميع الجودات حتى 320kbps.\n"
-        "• **صور:** مجانية لجميع الفئات بأعلى دقة متوفرة كصورة وكمستند أصلي.\n\n"
+        "• **الترجمة:** متاحة لـ 14 لغة عالمية بدقة 720p واضحة جداً.\n"
+        "• **صوت وصور:** مجانية لجميع الفئات بأعلى دقة متوفرة.\n\n"
         "4️⃣ **الأوامر المتوفرة:**\n"
         "• `/start` — بدء البوت وتحديث بياناتك\n"
         "• `/status` أو `/me` — رصيدك اليومي وحالة حسابك\n"
@@ -667,16 +733,158 @@ async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg_target.reply_text(
             "💎 **اشتراك OmniFetch بريميوم (لمدة 30 يوماً)**\n\n"
             "• **المدة:** 30 يوماً كاملة\n"
-            "• **السعر:** 5.00$ فقط (أو 250 نجمة تيليجرام)\n"
-            "• تحميل فيديو **غير محدود** بدون حد يومي\n"
-            "• فتح دقات العرض الفائقة: **1080p و 2K و 4K**\n"
-            "• أولوية قصوى وأعلى سرعة معالجة وتحويل على السيرفر\n"
-            "• دعم جميع المنصات ومقاطع الصوت والصور بأقصى جودة\n\n"
+            "• **السعر:** 5.00$ فقط (أو 250 نجمة تيليجرام)\n\n"
+            "🔓 **الميزات الحصرية التي ستُفتح لك:**\n"
+            "• 🌐 ترجمة الفيديوهات لـ 14 لغة عالمية (Hardsub + SRT)\n"
+            "• ✂️ قص المقاطع السحابي (Trim) بأي مدة وأعلى جودة\n"
+            "• 🎞️ صانع GIF المتحرك عالي الجودة\n"
+            "• 📹 دقات العرض الفائقة: **1080p و 2K و 4K**\n"
+            "• ♾️ تحميل فيديو **غير محدود** بدون حد يومي\n"
+            "• ⚡ أولوية قصوى وأعلى سرعة معالجة وتحويل\n"
+            "• 🎵 صوت ومقاطع صوتية بأقصى جودة MP3\n\n"
             f"📞 للدفع بالتحويل المحلي أو العملات الرقمية تواصل مع المدير: `{ADMIN_USERNAME}`\n\n"
             "اختر وسيلة الدفع التي تناسبك:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
+
+async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر الترجمة المباشر عبر السلاش: /translate أو /tr"""
+    user_status = get_or_update_user(update.effective_user)
+    if user_status["is_banned"]:
+        await update.message.reply_text("⛔ عذراً، أنت محظور من استخدام البوت.")
+        return
+
+    # --- بوابة البريميوم: الترجمة ميزة مدفوعة ---
+    if not user_status["is_premium"]:
+        await update.message.reply_text(
+            PREMIUM_GATE_TEXT,
+            reply_markup=get_premium_gate_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
+
+    text = (update.message.text or "").strip()
+    parts = text.split(maxsplit=1)
+
+    if len(parts) > 1 and ("http://" in parts[1] or "https://" in parts[1]):
+        url_match = re.search(r"https?://[^\s]+", parts[1])
+        if url_match:
+            clean_url = clean_tracking_parameters(url_match.group(0).rstrip(").,;!?\"'"))
+            context.user_data["pending_url"] = clean_url
+            await update.message.reply_text(
+                "🌐 **ميزة ترجمة الفيديوهات الاحترافية (AI Subtitles & Video Translation):**\n\n"
+                "🎯 **اختر اللغة التي تريد ترجمة ودمج الكلام بها داخل الفيديو (14 لغة عالمية):**\n\n"
+                "✨ سيتم دمج الترجمة على الفيديو بخط واضح وظل أنيق (Hardsub) مع إرسال ملف SRT المنفصل.",
+                reply_markup=get_translation_keyboard(include_back=False),
+                parse_mode="Markdown"
+            )
+            return
+
+    context.user_data["awaiting_translate_url"] = True
+    await update.message.reply_text(
+        "🌐 **أداة ترجمة الفيديوهات لـ 14 لغة عالمية:**\n\n"
+        "أرسل الآن رابط الفيديو المطلوب ترجمته (يوتيوب، بودكاست، محاضرات، تيك توك، إلخ).\n\n"
+        "💡 يمكنك أيضاً كتابة الأمر متبوعاً بالرابط مباشرة، مثال:\n"
+        "`/translate https://youtu.be/...`",
+        parse_mode="Markdown"
+    )
+
+async def trim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر قص الفيديو المباشر عبر السلاش: /trim"""
+    user_status = get_or_update_user(update.effective_user)
+    if user_status["is_banned"]:
+        await update.message.reply_text("⛔ عذراً، أنت محظور من استخدام البوت.")
+        return
+
+    # --- بوابة البريميوم: القص ميزة مدفوعة ---
+    if not user_status["is_premium"]:
+        await update.message.reply_text(
+            PREMIUM_GATE_TEXT,
+            reply_markup=get_premium_gate_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
+
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    url_found = None
+    for p in parts[1:]:
+        if p.startswith("http://") or p.startswith("https://"):
+            url_found = p
+            break
+
+    if url_found:
+        clean_url = clean_tracking_parameters(url_found)
+        context.user_data["pending_url"] = clean_url
+        context.user_data["awaiting_trim"] = True
+        await update.message.reply_text(
+            "✂️ **أداة قص مقطع محدد من الفيديو (Trim Video):**\n\n"
+            "أرسل الآن وقت البداية ووقت النهاية للمقطع المطلوب.\n"
+            "📝 أمثلة:\n"
+            "• `00:15 00:45`\n"
+            "• `01:00 01:30`\n"
+            "• `10 30`",
+            parse_mode="Markdown"
+        )
+        return
+
+    context.user_data["awaiting_trim_url"] = True
+    await update.message.reply_text(
+        "✂️ **أداة قص المقاطع السحابية:**\n\n"
+        "أرسل الآن رابط الفيديو المطلوب قصه.\n\n"
+        "💡 يمكنك أيضاً كتابة الأمر متبوعاً بالرابط مباشرة، مثال:\n"
+        "`/trim https://youtu.be/...`",
+        parse_mode="Markdown"
+    )
+
+async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر تحويل الفيديو إلى GIF عبر السلاش: /gif"""
+    user_status = get_or_update_user(update.effective_user)
+    if user_status["is_banned"]:
+        await update.message.reply_text("⛔ عذراً، أنت محظور من استخدام البوت.")
+        return
+
+    # --- بوابة البريميوم: صانع GIF ميزة مدفوعة ---
+    if not user_status["is_premium"]:
+        await update.message.reply_text(
+            PREMIUM_GATE_TEXT,
+            reply_markup=get_premium_gate_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
+
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    url_found = None
+    for p in parts[1:]:
+        if p.startswith("http://") or p.startswith("https://"):
+            url_found = p
+            break
+
+    if url_found:
+        clean_url = clean_tracking_parameters(url_found)
+        context.user_data["pending_url"] = clean_url
+        status_msg = await update.message.reply_text("⏳ _جاري التحويل لـ GIF..._", parse_mode="Markdown")
+        class CmdQuery:
+            def __init__(self, msg): self._msg = msg
+            async def answer(self): pass
+            async def edit_message_text(self, t, parse_mode=None):
+                return await self._msg.edit_text(t, parse_mode=parse_mode)
+            @property
+            def message(self): return self._msg
+        dummy_up = Update(update.update_id, callback_query=CmdQuery(status_msg))
+        await process_video_to_gif(dummy_up, context)
+        return
+
+    context.user_data["awaiting_gif_url"] = True
+    await update.message.reply_text(
+        "🎞️ **أداة تحويل الفيديو إلى GIF متحرك:**\n\n"
+        "أرسل الآن رابط الفيديو الذي تريد تحويله إلى GIF متحرك عالي الجودة.\n\n"
+        "💡 يمكنك أيضاً كتابة الأمر متبوعاً بالرابط مباشرة، مثال:\n"
+        "`/gif https://youtu.be/...`",
+        parse_mode="Markdown"
+    )
 
 # --- لوحة تحكم الإدارة الشاملة وبطاقة المستخدمين (ADMIN CONTROL PANEL & USER ENGINE) ---
 def render_user_card(user_info: dict) -> Tuple[str, InlineKeyboardMarkup]:
@@ -1135,6 +1343,9 @@ async def post_init_commands(app):
     """تسجيل قوائم الأوامر الرسمية في واجهة تيليجرام تلقائياً (زر القائمة Menu)."""
     user_commands = [
         BotCommand("start", "🚀 بدء استخدام البوت وتحديث بياناتك"),
+        BotCommand("translate", "🌐 ترجمة أي فيديو إلى 14 لغة عالمية"),
+        BotCommand("trim", "✂️ قص جزء محدد من الفيديو"),
+        BotCommand("gif", "🎞️ تحويل مقطع فيديو إلى GIF متحرك"),
         BotCommand("status", "📊 رصيدك اليومي وحالة حسابك الشخصي"),
         BotCommand("upgrade", "💎 ترقية الحساب إلى بريميوم والأسعار"),
         BotCommand("help", "📖 دليل الاستخدام والمنصات المدعومة"),
@@ -1752,6 +1963,782 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         parse_mode="Markdown"
     )
 
+# --- محرك الترجمة واستخراج النصوص للفيديوهات (VIDEO TRANSLATION & SUBTITLE ENGINE) ---
+
+def clean_tracking_parameters(url: str) -> str:
+    """إزالة وسوم التتبع التجسسية ومعاملات الإحالة من الروابط لحماية الخصوصية ومنع الأخطاء"""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+        tracking_keys = {
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+            "igsh", "si", "feature", "fbclid", "gclid", "_hsenc", "_hsmi", "ref"
+        }
+        filtered = {k: v for k, v in params.items() if k.lower() not in tracking_keys}
+        new_query = urllib.parse.urlencode(filtered, doseq=True)
+        return urllib.parse.urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment
+        ))
+    except Exception:
+        return url
+
+def detect_platform_badge(url_str: str) -> str:
+    """التعرف الذكي على المنصة وعرض الشعار المنسق الخاص بها"""
+    u = url_str.lower()
+    if "youtu" in u:
+        return "🔴 يوتيوب (YouTube)"
+    elif "tiktok.com" in u:
+        return "🎵 تيك توك (TikTok)"
+    elif "instagram.com" in u:
+        return "📸 إنستغرام (Instagram)"
+    elif "facebook.com" in u or "fb.watch" in u:
+        return "📘 فيسبوك (Facebook)"
+    elif "twitter.com" in u or "x.com" in u:
+        return "🐦 إكس / تويتر (X)"
+    elif "pinterest." in u or "pin.it" in u:
+        return "📌 بينترست (Pinterest)"
+    elif "reddit.com" in u:
+        return "🤖 ريديت (Reddit)"
+    elif "snapchat.com" in u:
+        return "👻 سناب شات (Snapchat)"
+    elif "threads.net" in u:
+        return "🧵 ثريدز (Threads)"
+    elif "soundcloud.com" in u:
+        return "☁️ ساوند كلاود (SoundCloud)"
+    elif "vimeo.com" in u:
+        return "🎬 فيميو (Vimeo)"
+    elif "dailymotion.com" in u:
+        return "📺 ديلي موشن (Dailymotion)"
+    return "🌐 منصة وسائط عامة"
+
+def ms_to_timestamp(ms: int) -> str:
+    """تحويل أجزاء الألف من الثانية إلى صيغة التوقيت القياسية 00:00:00,000"""
+    secs, m = divmod(ms, 1000)
+    mins, s = divmod(secs, 60)
+    h, m_val = divmod(mins, 60)
+    return f"{h:02d}:{m_val:02d}:{s:02d},{m:03d}"
+
+def normalize_time_str(t_str: str) -> str:
+    """توحيد صيغ التوقيت المختلفة إلى HH:MM:SS,mmm"""
+    t_str = t_str.replace('.', ',').strip()
+    parts = t_str.split(':')
+    if len(parts) == 2:
+        return f"00:{parts[0].zfill(2)}:{parts[1]}"
+    elif len(parts) == 3:
+        return f"{parts[0].zfill(2)}:{parts[1]}:{parts[2]}"
+    return t_str
+
+def parse_vtt_or_srt_text(content: str) -> List[dict]:
+    """استخراج المقاطع الزمنية والنصوص من ملفات VTT أو SRT"""
+    lines = content.splitlines()
+    cues = []
+    i = 0
+    time_pat = re.compile(r'(\d{1,2}:\d{2}[\.,]\d{3}|\d{1,2}:\d{2}:\d{2}[\.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}[\.,]\d{3}|\d{1,2}:\d{2}:\d{2}[\.,]\d{3})')
+    while i < len(lines):
+        line = lines[i].strip()
+        m = time_pat.search(line)
+        if m:
+            start_t = normalize_time_str(m.group(1))
+            end_t = normalize_time_str(m.group(2))
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip():
+                clean_t = re.sub(r'<[^>]+>', '', lines[i].strip())
+                clean_t = re.sub(r'\{[^\}]+\}', '', clean_t).strip()
+                if clean_t and not clean_t.startswith("NOTE") and not clean_t.startswith("STYLE"):
+                    text_lines.append(clean_t)
+                i += 1
+            if text_lines:
+                cues.append({
+                    "start": start_t,
+                    "end": end_t,
+                    "text": " ".join(text_lines)
+                })
+        else:
+            i += 1
+    return cues
+
+def parse_json3_subtitles(content: str) -> List[dict]:
+    """استخراج النصوص والمقاطع الزمنية من صيغة JSON3 الخاصة بيوتيوب"""
+    try:
+        data = json.loads(content)
+        cues = []
+        for ev in data.get("events", []):
+            if "segs" not in ev or "tStartMs" not in ev:
+                continue
+            s_ms = ev["tStartMs"]
+            d_ms = ev.get("dDurationMs", 2000)
+            txt = "".join(s.get("utf8", "") for s in ev["segs"]).replace("\n", " ").strip()
+            if txt:
+                cues.append({
+                    "start": ms_to_timestamp(s_ms),
+                    "end": ms_to_timestamp(s_ms + d_ms),
+                    "text": txt
+                })
+        return cues
+    except Exception as e:
+        logger.error(f"Error parsing json3: {e}")
+        return []
+
+def translate_cues_network(cues: List[dict], target_lang: str, src_lang: str = "") -> List[dict]:
+    """ترجمة مقاطع الترجمة في دفعات ذكية وسريعة باستخدام محرك الترجمة العصبي"""
+    if not cues:
+        return []
+    # إذا كانت لغة المصدر هي نفسها لغة الهدف المختارة، نستخدم المقاطع الأصلية مباشرة
+    if src_lang and (src_lang == target_lang or src_lang.startswith(f"{target_lang}-") or (target_lang == "zh-CN" and "zh" in src_lang)):
+        return cues
+
+    chunk_size = 20
+    translated = []
+    for i in range(0, len(cues), chunk_size):
+        chunk = cues[i:i+chunk_size]
+        texts = [c["text"].replace("\n", " ").strip() for c in chunk]
+        delim = " ___CUE___ "
+        combined = delim.join(texts)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q=" + urllib.parse.quote(combined)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                full_trans = "".join([part[0] for part in data[0] if part[0]])
+            parts = full_trans.split("___CUE___")
+            clean_parts = [p.strip() for p in parts]
+            while len(clean_parts) < len(texts):
+                clean_parts.append(texts[len(clean_parts)])
+            for j, c in enumerate(chunk):
+                translated.append({
+                    "start": c["start"],
+                    "end": c["end"],
+                    "text": clean_parts[j]
+                })
+        except Exception as e:
+            logger.warning(f"Translation batch failed ({e}), using original text...")
+            for c in chunk:
+                translated.append(c)
+    return translated
+
+def cues_to_srt_str(cues: List[dict]) -> str:
+    """تحويل المقاطع إلى نص SRT قياسي"""
+    lines = []
+    for idx, c in enumerate(cues, start=1):
+        lines.append(str(idx))
+        lines.append(f"{c['start']} --> {c['end']}")
+        lines.append(c['text'])
+        lines.append("")
+    return "\n".join(lines)
+
+def cues_to_ass_str(cues: List[dict]) -> str:
+    """تحويل المقاطع إلى صيغة ASS الاحترافية مع تخصيص المظهر والخلفية المظللة والخطوط المتناسقة"""
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1280\n"
+        "PlayResY: 720\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,26,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,3,2,0,2,20,20,35,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    events = []
+    for c in cues:
+        s_parts = c['start'].replace(',', '.').split(':')
+        e_parts = c['end'].replace(',', '.').split(':')
+        s_h = int(s_parts[0])
+        e_h = int(e_parts[0])
+        s_time = f"{s_h}:{s_parts[1]}:{float(s_parts[2]):05.2f}"
+        e_time = f"{e_h}:{e_parts[1]}:{float(e_parts[2]):05.2f}"
+        clean_txt = c['text'].replace('\n', '\\N').replace('{', '').replace('}', '')
+        events.append(f"Dialogue: 0,{s_time},{e_time},Default,,0,0,0,,{clean_txt}")
+    return header + "\n".join(events) + "\n"
+
+def extract_best_subtitles(info_dict: dict, target_lang: str = "ar") -> Tuple[Optional[str], str, str]:
+    """
+    استخراج أفضل مسار ترجمة وتفريغ صوتي متوفر (VTT, JSON3, SRT)
+    يبحث أولاً عن لغة الهدف المطلوبة إذا كانت متوفرة مسبقاً، أو يستخرج الإنجليزية/المتوفر لترجمتها
+    يرجع: (محتوى_الترجمة_كنص, الامتداد, لغة_المصدر)
+    """
+    subs = info_dict.get("subtitles") or {}
+    auto_subs = info_dict.get("automatic_captions") or {}
+
+    # 1. فحص إذا كانت الترجمة المطلوبة متوفرة مباشرة في ترجمات الفيديو الرسمية
+    target_pool = None
+    chosen_lang = None
+    for pool in [subs, auto_subs]:
+        for lk in pool.keys():
+            if lk == target_lang or lk.startswith(f"{target_lang}-") or (target_lang == "zh-CN" and "zh" in lk):
+                target_pool = pool
+                chosen_lang = lk
+                break
+        if target_pool:
+            break
+
+    # 2. إذا لم تكن لغة الهدف متوفرة كمسار جاهز، نختار الإنجليزية أو أول تفريغ صوتي متاح للترجمة
+    if not target_pool:
+        target_pool = subs if subs else auto_subs
+        if not target_pool:
+            return None, "", ""
+        for pref in ["en", "en-US", "en-GB"]:
+            if pref in target_pool:
+                chosen_lang = pref
+                break
+        if not chosen_lang:
+            chosen_lang = list(target_pool.keys())[0]
+
+    formats = target_pool[chosen_lang]
+    chosen_format = None
+    for pref_ext in ["json3", "vtt", "srt", "srv1"]:
+        match = [f for f in formats if f.get("ext") == pref_ext]
+        if match:
+            chosen_format = match[0]
+            break
+    if not chosen_format and formats:
+        chosen_format = formats[0]
+
+    if not chosen_format or not chosen_format.get("url"):
+        return None, "", ""
+
+    sub_url = chosen_format["url"]
+    req = urllib.request.Request(sub_url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+            return content, chosen_format.get("ext", "vtt"), chosen_lang
+    except Exception as e:
+        logger.error(f"Failed to fetch subtitle content: {e}")
+        return None, "", ""
+
+
+async def process_video_translation(update: Update, context: ContextTypes.DEFAULT_TYPE, target_lang_code: str):
+    """المحرك الكامل لترجمة الفيديو وتوليد ودمج الترجمة الملونة الاحترافية وإرسالها للمستخدم"""
+    query = update.callback_query
+    await query.answer()
+    
+    url = context.user_data.get("pending_url")
+    if not url:
+        await query.edit_message_text("❌ انتهت صلاحية الجلسة، يرجى إعادة إرسال الرابط من جديد.")
+        return
+
+    user_id = update.effective_user.id
+    status = get_or_update_user(update.effective_user)
+    if status["is_banned"]:
+        await query.edit_message_text("⛔ أنت محظور من استخدام البوت.")
+        return
+
+    # --- بوابة البريميوم الحصرية: ميزة الترجمة مدفوعة فقط ---
+    if not status["is_premium"]:
+        await query.edit_message_text(
+            PREMIUM_GATE_TEXT,
+            reply_markup=get_premium_gate_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
+
+
+    lang_info = TRANSLATION_LANGUAGES.get(target_lang_code, {"name": target_lang_code, "flag": "🌐", "code": target_lang_code})
+    lang_name = lang_info["name"]
+    lang_flag = lang_info["flag"]
+
+    status_msg = await query.edit_message_text(
+        f"🔍 **[1/4] جاري فحص الرابط والبحث عن الترجمة والتفريغ الصوتي...**\n"
+        f"⏳ _يرجى الانتظار لحظات..._",
+        parse_mode="Markdown"
+    )
+
+    loop = asyncio.get_running_loop()
+
+    def extract_info():
+        ydl_opts_info = {
+            "quiet": True,
+            "noplaylist": True,
+            "nocheckcertificate": True,
+            "socket_timeout": 25,
+            "geo_bypass": True,
+            "no_color": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+            },
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["ios", "android", "mweb"]
+                }
+            }
+        }
+        if os.path.exists(COOKIES_FILE):
+            ydl_opts_info["cookiefile"] = COOKIES_FILE
+        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    try:
+        info_dict = await loop.run_in_executor(None, extract_info)
+        if not info_dict:
+            raise ValueError("تعذر استخراج بيانات الفيديو.")
+
+        media_title = (info_dict.get("title") or "فيديو")[:80]
+
+        content, sub_ext, src_lang = await loop.run_in_executor(None, extract_best_subtitles, info_dict, target_lang_code)
+        if not content:
+            back_kb = [
+                [InlineKeyboardButton("📹 تحميل كفيديو عادي", callback_data="choose_type_video")],
+                [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="choose_type_back")]
+            ]
+            await status_msg.edit_text(
+                "⚠️ **عذراً، لم يتم العثور على ترجمة أو تفريغ صوتي متاح لهذا المقطع.**\n\n"
+                "💡 ميزة ترجمة الفيديوهات تعتمد على وجود تفريغ صوتي أو ترجمة مصاحبة للفيديو (مثل مقاطع يوتيوب، تيد، والمحاضرات والبودكاست).\n\n"
+                "يمكنك تحميل الفيديو بجودته الأصلية مباشرة:",
+                reply_markup=InlineKeyboardMarkup(back_kb),
+                parse_mode="Markdown"
+            )
+            return
+
+        if sub_ext == "json3":
+            cues = parse_json3_subtitles(content)
+        else:
+            cues = parse_vtt_or_srt_text(content)
+
+        if not cues:
+            raise ValueError("لم يتم العثور على أسطر صالحة للترجمة في ملف التفريغ الصوتي.")
+
+        await status_msg.edit_text(
+            f"🌐 **[2/4] جاري تجهيز وترجمة {len(cues)} مقطع صوتي إلى {lang_flag} {lang_name}...**\n"
+            f"⚡ _جاري المعالجة الفورية بالذكاء الاصطناعي..._",
+            parse_mode="Markdown"
+        )
+
+        translated_cues = await loop.run_in_executor(None, translate_cues_network, cues, target_lang_code, src_lang)
+
+        srt_content = cues_to_srt_str(translated_cues)
+        ass_content = cues_to_ass_str(translated_cues)
+
+        srt_filename = f"{user_id}_sub_{target_lang_code}.srt"
+        ass_filename = f"{user_id}_sub_{target_lang_code}.ass"
+        srt_path = os.path.join(DOWNLOAD_DIR, srt_filename)
+        ass_path = os.path.join(DOWNLOAD_DIR, ass_filename)
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_content)
+
+        await status_msg.edit_text(
+            f"⬇️ **[3/4] جاري تنزيل الفيديو ودمج الترجمة الاحترافية عليه (Hardsub)...**\n"
+            f"🎬 _جاري المعالجة الاحترافية عبر FFmpeg..._",
+            parse_mode="Markdown"
+        )
+
+        raw_vid_tmpl = os.path.join(DOWNLOAD_DIR, f"{user_id}_raw_%(id)s.%(ext)s")
+        dl_opts = {
+            "outtmpl": raw_vid_tmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "nocheckcertificate": True,
+            "socket_timeout": 35,
+            "geo_bypass": True,
+            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "merge_output_format": "mp4",
+        }
+        if os.path.exists(COOKIES_FILE):
+            dl_opts["cookiefile"] = COOKIES_FILE
+
+        def run_dl_video():
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                inf = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(inf)
+
+        raw_video_path = await loop.run_in_executor(None, run_dl_video)
+        
+        if not os.path.exists(raw_video_path):
+            base_p, _ = os.path.splitext(raw_video_path)
+            for ex in [".mp4", ".mkv", ".webm"]:
+                if os.path.exists(base_p + ex):
+                    raw_video_path = base_p + ex
+                    break
+
+        if not os.path.exists(raw_video_path):
+            raise FileNotFoundError("تعذر العثور على الفيديو بعد تنزيله.")
+
+        output_translated_mp4 = os.path.join(DOWNLOAD_DIR, f"{user_id}_translated_{target_lang_code}.mp4")
+        rel_in = os.path.relpath(raw_video_path).replace("\\", "/")
+        rel_sub = os.path.relpath(ass_path).replace("\\", "/")
+        rel_out = os.path.relpath(output_translated_mp4).replace("\\", "/")
+
+        def run_ffmpeg_burn():
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", rel_in,
+                "-vf", f"subtitles={rel_sub}",
+                "-c:a", "copy",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                rel_out
+            ]
+            res = subprocess.run(cmd, capture_output=True)
+            if res.returncode != 0:
+                logger.warning(f"FFmpeg burn failed: {res.stderr.decode('utf-8', errors='ignore')}")
+                rel_srt = os.path.relpath(srt_path).replace("\\", "/")
+                cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-i", rel_in,
+                    "-vf", f"subtitles={rel_srt}",
+                    "-c:a", "copy",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "23",
+                    rel_out
+                ]
+                subprocess.run(cmd_fallback, check=True)
+
+        await loop.run_in_executor(None, run_ffmpeg_burn)
+
+        if not os.path.exists(output_translated_mp4):
+            output_translated_mp4 = raw_video_path
+
+        await status_msg.edit_text(
+            f"📤 **[4/4] جاري رفع الفيديو المترجم إلى تيليجرام...**\n"
+            f"🚀 _شارفنا على الانتهاء!_",
+            parse_mode="Markdown"
+        )
+
+        file_size = os.path.getsize(output_translated_mp4)
+        MAX_TELEGRAM_LIMIT = 50 * 1024 * 1024
+        if file_size > MAX_TELEGRAM_LIMIT:
+            with open(srt_path, "rb") as f_sub:
+                await query.message.reply_document(
+                    document=f_sub,
+                    caption=(
+                        f"🎬 **{media_title}**\n\n"
+                        f"🌐 **ملف الترجمة ({lang_flag} {lang_name})**\n\n"
+                        f"⚠️ حجم الفيديو بعد الدمج تجاوز 50MB (حد تيليجرام للبوتات).\n"
+                        f"تم إرسال ملف الترجمة SRT لتقوم بتشغيله مع الفيديو في هاتفك أو عبر تطبيق VLC."
+                    ),
+                    filename=f"{media_title}_{target_lang_code}.srt"
+                )
+            return
+
+        caption_video = (
+            f"🎬 **{media_title}**\n\n"
+            f"🌐 **مترجم إلى:** {lang_flag} {lang_name}\n"
+            f"🤖 بواسطة: @OmniFetch45_Bot"
+        )
+
+        with open(output_translated_mp4, "rb") as f_vid:
+            try:
+                await query.message.reply_video(
+                    video=f_vid,
+                    caption=caption_video,
+                    supports_streaming=True,
+                    parse_mode="Markdown",
+                    read_timeout=300,
+                    write_timeout=300,
+                    connect_timeout=60,
+                )
+            except Exception:
+                f_vid.seek(0)
+                await query.message.reply_document(
+                    document=f_vid,
+                    caption=caption_video,
+                    filename=f"{media_title}_translated_{target_lang_code}.mp4",
+                    read_timeout=300,
+                    write_timeout=300,
+                )
+
+        with open(srt_path, "rb") as f_srt:
+            try:
+                await query.message.reply_document(
+                    document=f_srt,
+                    caption=f"📄 **ملف الترجمة المنفصل ({lang_flag} {lang_name})**\n💡 يمكنك استخدامه مع مشغل VLC أو أي برنامج آخر.",
+                    filename=f"Subtitle_{target_lang_code}.srt"
+                )
+            except Exception:
+                pass
+
+        increment_confirmed_download(user_id, is_free_tier=not status["is_premium"])
+        refreshed_status = get_or_update_user(update.effective_user)
+
+        if not status["is_premium"]:
+            remaining_today = max(0, DAILY_FREE_LIMIT - refreshed_status['count'])
+            await status_msg.edit_text(
+                f"✅ **تمت ترجمة الفيديو وإرساله بنجاح!**\n"
+                f"🌐 اللغة: {lang_flag} {lang_name}\n"
+                f"📊 المتبقي من رصيدك اليومي: **{remaining_today}**\n"
+                f"💎 للترجمة والتحميل غير المحدود اشترك عبر: `/upgrade`",
+                parse_mode="Markdown"
+            )
+        else:
+            await status_msg.edit_text(
+                f"✅ **تمت ترجمة الفيديو وإرساله بنجاح!**\n"
+                f"🌐 اللغة: {lang_flag} {lang_name}\n"
+                f"💎 باقة بريميوم نشطة (متبقي {status['days_left']} يوم)",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error(f"Translation failed: {e}")
+        clean_err = str(e).replace("`", "").replace("*", "").replace("_", "")[:180]
+        back_kb = [
+            [InlineKeyboardButton("📹 تحميل كفيديو عادي", callback_data="choose_type_video")],
+            [InlineKeyboardButton("💬 تواصل مع المدير @CYS_ALI3", url=ADMIN_URL)]
+        ]
+        await status_msg.edit_text(
+            f"❌ **عذراً، فشلت ترجمة هذا الفيديو:**\n{clean_err}\n\nيمكنك تحميله كفيديو عادي أو التواصل مع الإدارة:",
+            reply_markup=InlineKeyboardMarkup(back_kb),
+            parse_mode="Markdown"
+        )
+    finally:
+        try:
+            prefix = f"{user_id}_"
+            for fname in os.listdir(DOWNLOAD_DIR):
+                if fname.startswith(prefix) and not fname.endswith(IMAGE_EXTENSIONS):
+                    f_path = os.path.join(DOWNLOAD_DIR, fname)
+                    try:
+                        if os.path.isfile(f_path):
+                            os.remove(f_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+async def handle_trim_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قص مقطع محدد من الفيديو بناءً على توقيت البداية والنهاية المرسل من المستخدم"""
+    context.user_data["awaiting_trim"] = False
+    text = (update.message.text or "").strip()
+    url = context.user_data.get("pending_url")
+    if not url:
+        await update.message.reply_text("❌ انتهت صلاحية الجلسة، يرجى إعادة إرسال الرابط من جديد.")
+        return
+
+    times = text.split()
+    if len(times) != 2:
+        await update.message.reply_text(
+            "⚠️ يرجى إرسال وقت البداية والنهاية مفصولين بمسافة واحدة.\nمثال: `00:15 00:45` أو `10 40`",
+            parse_mode="Markdown"
+        )
+        return
+
+    start_str, end_str = times[0], times[1]
+    user_id = update.effective_user.id
+    status = get_or_update_user(update.effective_user)
+    if status["is_banned"]:
+        await update.message.reply_text("⛔ عذراً، أنت محظور من استخدام البوت.")
+        return
+
+    # --- بوابة البريميوم الحصرية: ميزة قص المقاطع مدفوعة فقط ---
+    if not status["is_premium"]:
+        await update.message.reply_text(
+            PREMIUM_GATE_TEXT,
+            reply_markup=get_premium_gate_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        f"✂️ **جاري تنزيل وقص المقطع من (`{start_str}`) إلى (`{end_str}`)...**\n⏳ _لحظات من فضلك..._",
+        parse_mode="Markdown"
+    )
+
+    loop = asyncio.get_running_loop()
+    raw_vid_tmpl = os.path.join(DOWNLOAD_DIR, f"{user_id}_trim_raw_%(id)s.%(ext)s")
+    dl_opts = {
+        "outtmpl": raw_vid_tmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "socket_timeout": 35,
+        "geo_bypass": True,
+        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "merge_output_format": "mp4",
+    }
+    if os.path.exists(COOKIES_FILE):
+        dl_opts["cookiefile"] = COOKIES_FILE
+
+    try:
+        def run_dl():
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                inf = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(inf), (inf.get("title") or "مقطع مقصوص")
+
+        raw_path, vid_title = await loop.run_in_executor(None, run_dl)
+        if not os.path.exists(raw_path):
+            base_p, _ = os.path.splitext(raw_path)
+            for ex in [".mp4", ".mkv", ".webm"]:
+                if os.path.exists(base_p + ex):
+                    raw_path = base_p + ex
+                    break
+
+        trimmed_out = os.path.join(DOWNLOAD_DIR, f"{user_id}_trimmed.mp4")
+        rel_in = os.path.relpath(raw_path).replace("\\", "/")
+        rel_out = os.path.relpath(trimmed_out).replace("\\", "/")
+
+        def parse_seconds(t: str) -> float:
+            parts = t.strip().split(":")
+            if len(parts) == 1:
+                return float(parts[0])
+            elif len(parts) == 2:
+                return int(parts[0]) * 60 + float(parts[1])
+            elif len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            return 0.0
+
+        try:
+            s_sec = parse_seconds(start_str)
+            e_sec = parse_seconds(end_str)
+            dur_sec = max(1.0, e_sec - s_sec)
+        except Exception:
+            s_sec = 0.0
+            dur_sec = 10.0
+
+        def run_cut():
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(s_sec),
+                "-i", rel_in,
+                "-t", str(dur_sec),
+                "-c", "copy",
+                rel_out
+            ]
+            res = subprocess.run(cmd, capture_output=True)
+            if res.returncode != 0:
+                cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-ss", str(s_sec),
+                    "-i", rel_in,
+                    "-t", str(dur_sec),
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    rel_out
+                ]
+                subprocess.run(cmd_fallback, check=True, capture_output=True)
+
+        await loop.run_in_executor(None, run_cut)
+
+        with open(trimmed_out, "rb") as f_trim:
+            await update.message.reply_video(
+                video=f_trim,
+                caption=f"✂️ **{vid_title}**\n⏱ **المقطع:** من `{start_str}` إلى `{end_str}`\n🤖 بواسطة: @OmniFetch45_Bot",
+                parse_mode="Markdown"
+            )
+
+        increment_confirmed_download(user_id, is_free_tier=not status["is_premium"])
+        await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Trim failed: {e}")
+        await status_msg.edit_text(f"❌ فشل قص المقطع: {e}\nتأكد من صيغة التوقيت بشكل صحيح (مثال: `00:15 00:45`).")
+    finally:
+        prefix = f"{user_id}_trim_"
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.startswith(prefix) or f.startswith(f"{user_id}_trimmed"):
+                try:
+                    os.remove(os.path.join(DOWNLOAD_DIR, f))
+                except Exception:
+                    pass
+
+async def process_video_to_gif(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحويل مقطع فيديو قصير إلى رسوم متحركة GIF عالية النقاوة وسريعة التحميل"""
+    query = update.callback_query
+    await query.answer()
+    url = context.user_data.get("pending_url")
+    if not url:
+        await query.edit_message_text("❌ انتهت صلاحية الجلسة، يرجى إعادة إرسال الرابط من جديد.")
+        return
+
+    user_id = update.effective_user.id
+    status = get_or_update_user(update.effective_user)
+    if status["is_banned"]:
+        await query.edit_message_text("⛔ أنت محظور من استخدام البوت.")
+        return
+
+    # --- بوابة البريميوم الحصرية: ميزة تحويل GIF مدفوعة فقط ---
+    if not status["is_premium"]:
+        await query.edit_message_text(
+            PREMIUM_GATE_TEXT,
+            reply_markup=get_premium_gate_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
+
+    status_msg = await query.edit_message_text(
+        "🎞️ **جاري تحويل المقطع إلى GIF متحرك عالي الجودة...**\n⏳ _لحظات من فضلك..._",
+        parse_mode="Markdown"
+    )
+
+    loop = asyncio.get_running_loop()
+    raw_vid_tmpl = os.path.join(DOWNLOAD_DIR, f"{user_id}_gif_raw_%(id)s.%(ext)s")
+    dl_opts = {
+        "outtmpl": raw_vid_tmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "socket_timeout": 35,
+        "geo_bypass": True,
+        "format": "bestvideo[height<=480]/best[height<=480]/best",
+        "merge_output_format": "mp4",
+    }
+    if os.path.exists(COOKIES_FILE):
+        dl_opts["cookiefile"] = COOKIES_FILE
+
+    try:
+        def run_dl():
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                inf = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(inf), (inf.get("title") or "GIF")
+
+        raw_path, vid_title = await loop.run_in_executor(None, run_dl)
+        if not os.path.exists(raw_path):
+            base_p, _ = os.path.splitext(raw_path)
+            for ex in [".mp4", ".mkv", ".webm"]:
+                if os.path.exists(base_p + ex):
+                    raw_path = base_p + ex
+                    break
+
+        gif_out = os.path.join(DOWNLOAD_DIR, f"{user_id}_anim.gif")
+        rel_in = os.path.relpath(raw_path).replace("\\", "/")
+        rel_out = os.path.relpath(gif_out).replace("\\", "/")
+
+        def run_gif_conv():
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", rel_in,
+                "-t", "8",
+                "-vf", "fps=10,scale=360:-1:flags=lanczos",
+                rel_out
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+
+        await loop.run_in_executor(None, run_gif_conv)
+
+        with open(gif_out, "rb") as f_gif:
+            await query.message.reply_animation(
+                animation=f_gif,
+                caption=f"🎞️ **{vid_title}**\n🤖 بواسطة: @OmniFetch45_Bot",
+                parse_mode="Markdown"
+            )
+        await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"GIF generation failed: {e}")
+        await status_msg.edit_text(f"❌ فشل تحويل المقطع إلى GIF: {e}")
+    finally:
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.startswith(f"{user_id}_gif_") or f.startswith(f"{user_id}_anim"):
+                try:
+                    os.remove(os.path.join(DOWNLOAD_DIR, f))
+                except Exception:
+                    pass
+
 # --- استقبال الروابط (MEDIA HANDLER) ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_status = get_or_update_user(update.effective_user)
@@ -1762,6 +2749,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
+
+    # 0. فحص إذا كان المستخدم في وضع قص مقطع محدد (Trim Mode)
+    if context.user_data.get("awaiting_trim"):
+        await handle_trim_input(update, context)
+        return
 
     # 1. فحص إذا كان المدير في وضع البحث عن مستخدم بالآيدي أو المعرف
     if is_admin(user_id) and context.user_data.get("awaiting_user_search"):
@@ -1833,28 +2825,104 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    clean_url = url_match.group(0).rstrip(").,;!?\"'")
+    raw_url = url_match.group(0).rstrip(").,;!?\"'")
+    clean_url = clean_tracking_parameters(raw_url)
     context.user_data["pending_url"] = clean_url
 
+    # إذا كان المستخدم في وضع طلب ترجمة بعد كتابة /translate
+    if context.user_data.pop("awaiting_translate_url", False):
+        if not user_status["is_premium"]:
+            await update.message.reply_text(
+                PREMIUM_GATE_TEXT,
+                reply_markup=get_premium_gate_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        await update.message.reply_text(
+            "🌐 **ميزة ترجمة الفيديوهات الاحترافية (AI Subtitles & Video Translation):**\n\n"
+            "🎯 **اختر اللغة التي تريد ترجمة ودمج الكلام بها داخل الفيديو (14 لغة عالمية):**\n\n"
+            "✨ سيقوم البوت باستخراج الكلام وترجمته ودمجه بالفيديو فورياً (Hardsub) مع إرسال ملف SRT الأصلي.",
+            reply_markup=get_translation_keyboard(include_back=True),
+            parse_mode="Markdown"
+        )
+        return
+
+    # إذا كان المستخدم في وضع طلب قص بعد كتابة /trim
+    if context.user_data.pop("awaiting_trim_url", False):
+        if not user_status["is_premium"]:
+            await update.message.reply_text(
+                PREMIUM_GATE_TEXT,
+                reply_markup=get_premium_gate_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        context.user_data["awaiting_trim"] = True
+        await update.message.reply_text(
+            "✂️ **أداة قص مقطع محدد من الفيديو (Trim Video):**\n\n"
+            "أرسل الآن وقت البداية ووقت النهاية للمقطع المطلوب.\n"
+            "📝 أمثلة:\n"
+            "• `00:15 00:45`\n"
+            "• `01:00 01:30`\n"
+            "• `10 30`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # إذا كان المستخدم في وضع طلب GIF بعد كتابة /gif
+    if context.user_data.pop("awaiting_gif_url", False):
+        if not user_status["is_premium"]:
+            await update.message.reply_text(
+                PREMIUM_GATE_TEXT,
+                reply_markup=get_premium_gate_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        status_msg = await update.message.reply_text("⏳ _جاري التحويل لـ GIF..._", parse_mode="Markdown")
+        class CmdQuery:
+            def __init__(self, msg): self._msg = msg
+            async def answer(self): pass
+            async def edit_message_text(self, t, parse_mode=None):
+                return await self._msg.edit_text(t, parse_mode=parse_mode)
+            @property
+            def message(self): return self._msg
+        dummy_up = Update(update.update_id, callback_query=CmdQuery(status_msg))
+        await process_video_to_gif(dummy_up, context)
+        return
+
+    # عرض علامة القفل 🔒 على الميزات المدفوعة للمستخدمين المجانيين
+    is_prem = user_status["is_premium"]
+    tr_label = "🌐 ترجمة الفيديو (14 لغة) 🔤" if is_prem else "🔒 ترجمة الفيديو [بريميوم 💎]"
+    trim_label = "✂️ قص مقطع محدد (Trim)" if is_prem else "🔒 قص مقطع [بريميوم 💎]"
+    gif_label = "🎞️ تحويل لـ GIF متحرك" if is_prem else "🔒 GIF متحرك [بريميوم 💎]"
     keyboard = [
         [
             InlineKeyboardButton("📹 تحميل كفيديو (Video)", callback_data="choose_type_video"),
             InlineKeyboardButton("🎵 تحميل كصوت (Audio)", callback_data="choose_type_audio"),
         ],
         [
-            InlineKeyboardButton("🖼️ استخراج الصور / الألبوم (Image)", callback_data="choose_type_image"),
+            InlineKeyboardButton(tr_label, callback_data="choose_type_translate"),
+            InlineKeyboardButton("🖼️ استخراج الصور / الألبوم", callback_data="choose_type_image"),
+        ],
+        [
+            InlineKeyboardButton(trim_label, callback_data="choose_type_trim"),
+            InlineKeyboardButton(gif_label, callback_data="choose_type_gif"),
         ],
         [
             InlineKeyboardButton("💬 تواصل مع المدير 👨‍💼", url=ADMIN_URL),
         ]
     ]
+    badge = detect_platform_badge(clean_url)
+    tier_badge = "💎 **عضوية بريميوم (غير محدودة)**" if is_prem else f"👤 **حساب مجاني** (المتبقي: `{max(0, DAILY_FREE_LIMIT - user_status['count'])}/{DAILY_FREE_LIMIT}` اليوم)"
     await update.message.reply_text(
-        "🎯 **اختر نوع التحميل المطلوب لهذا الرابط:**",
+        f"🎯 **معالجة الرابط:**\n"
+        f"• **المنصة:** {badge}\n"
+        f"• **حسابك:** {tier_badge}\n\n"
+        f"اختر نوع التحميل أو المعالجة المطلوبة لهذا الرابط:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
-# --- قائمة اختيار الدقات والجودات التفاعلية ---
+# --- قائمة اختيار الدقات والجودات والترجمة التفاعلية ---
 async def media_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -1882,23 +2950,109 @@ async def media_selection_callback(update: Update, context: ContextTypes.DEFAULT
 
     elif data == "choose_type_back":
         await query.answer()
+        context.user_data["awaiting_trim"] = False
+        # عرض علامة القفل 🔒 على الميزات المدفوعة للمستخدمين المجانيين
+        is_prem = user_status["is_premium"]
+        tr_label = "🌐 ترجمة الفيديو (14 لغة) 🔤" if is_prem else "🔒 ترجمة الفيديو [بريميوم 💎]"
+        trim_label = "✂️ قص مقطع محدد (Trim)" if is_prem else "🔒 قص مقطع [بريميوم 💎]"
+        gif_label = "🎞️ تحويل لـ GIF متحرك" if is_prem else "🔒 GIF متحرك [بريميوم 💎]"
         keyboard = [
             [
                 InlineKeyboardButton("📹 تحميل كفيديو (Video)", callback_data="choose_type_video"),
                 InlineKeyboardButton("🎵 تحميل كصوت (Audio)", callback_data="choose_type_audio"),
             ],
             [
-                InlineKeyboardButton("🖼️ استخراج الصور / الألبوم (Image)", callback_data="choose_type_image"),
+                InlineKeyboardButton(tr_label, callback_data="choose_type_translate"),
+                InlineKeyboardButton("🖼️ استخراج الصور / الألبوم", callback_data="choose_type_image"),
+            ],
+            [
+                InlineKeyboardButton(trim_label, callback_data="choose_type_trim"),
+                InlineKeyboardButton(gif_label, callback_data="choose_type_gif"),
             ],
             [
                 InlineKeyboardButton("💬 تواصل مع المدير 👨‍💼", url=ADMIN_URL),
             ]
         ]
+        badge = detect_platform_badge(url)
+        tier_badge = "💎 **عضوية بريميوم (غير محدودة)**" if is_prem else f"👤 **حساب مجاني** (المتبقي: `{max(0, DAILY_FREE_LIMIT - user_status['count'])}/{DAILY_FREE_LIMIT}` اليوم)"
         await query.edit_message_text(
-            "🎯 **اختر نوع التحميل المطلوب:**",
+            f"🎯 **معالجة الرابط:**\n"
+            f"• **المنصة:** {badge}\n"
+            f"• **حسابك:** {tier_badge}\n\n"
+            f"اختر نوع التحميل أو المعالجة المطلوبة:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
+        return
+
+    elif data == "choose_type_translate":
+        await query.answer()
+        # --- بوابة البريميوم: الترجمة ميزة مدفوعة ---
+        if not user_status["is_premium"]:
+            await query.edit_message_text(
+                PREMIUM_GATE_TEXT,
+                reply_markup=get_premium_gate_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        await query.edit_message_text(
+            "🌐 **ميزة ترجمة الفيديوهات الاحترافية (AI Subtitles & Video Translation):**\n\n"
+            "🎯 **اختر اللغة التي تريد ترجمة ودمج الكلام بها داخل الفيديو (14 لغة عالمية):**\n\n"
+            "✨ سيقوم البوت باستخراج الكلام وترجمته ودمجه بالفيديو بخط واضح وخلفية أنيقة (Hardsub)، كما ستحصل على ملف الترجمة الأصلي (SRT) منفصلاً.",
+            reply_markup=get_translation_keyboard(include_back=True),
+            parse_mode="Markdown"
+        )
+        return
+
+    elif data.startswith("tr_lang_"):
+        # --- بوابة البريميوم: تأكيد مزدوج عند اختيار اللغة ---
+        if not user_status["is_premium"]:
+            await query.answer(
+                "🔒 عذراً، ترجمة الفيديوهات متاحة فقط لمشتركي البريميوم 💎\n"
+                "يمكنك الترقية عبر /upgrade",
+                show_alert=True
+            )
+            return
+        target_lang = data.replace("tr_lang_", "")
+        await process_video_translation(update, context, target_lang)
+        return
+
+    elif data == "choose_type_trim":
+        await query.answer()
+        # --- بوابة البريميوم: القص ميزة مدفوعة ---
+        if not user_status["is_premium"]:
+            await query.edit_message_text(
+                PREMIUM_GATE_TEXT,
+                reply_markup=get_premium_gate_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        context.user_data["awaiting_trim"] = True
+        cancel_kb = [[InlineKeyboardButton("🔙 إلغاء والرجوع للقائمة", callback_data="choose_type_back")]]
+        await query.edit_message_text(
+            "✂️ **أداة قص مقطع محدد من الفيديو (Trim Video):**\n\n"
+            "أرسل الآن رسالة تحتوي على **وقت البداية** و **وقت النهاية** للمقطع المطلوب.\n\n"
+            "📝 **أمثلة مقبولة:**\n"
+            "• `00:15 00:45` (من الثانية 15 إلى الثانية 45)\n"
+            "• `01:30 02:15` (من الدقيقة 1:30 إلى الدقيقة 2:15)\n"
+            "• `10 50` (من 10 ثواني إلى 50 ثانية)\n\n"
+            "⚡ سيتم تنزيل هذا الجزء وقصه فقط بجودة عالية وبدون استهلاك بياناتك!",
+            reply_markup=InlineKeyboardMarkup(cancel_kb),
+            parse_mode="Markdown"
+        )
+        return
+
+    elif data == "choose_type_gif":
+        await query.answer()
+        # --- بوابة البريميوم: GIF ميزة مدفوعة ---
+        if not user_status["is_premium"]:
+            await query.edit_message_text(
+                PREMIUM_GATE_TEXT,
+                reply_markup=get_premium_gate_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        await process_video_to_gif(update, context)
         return
 
     elif data == "choose_type_image":
@@ -2548,6 +3702,9 @@ def main():
 
     # أوامر المستخدمين العامة (موسعة)
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler(["translate", "tr"], translate_command))
+    app.add_handler(CommandHandler("trim", trim_command))
+    app.add_handler(CommandHandler("gif", gif_command))
     app.add_handler(CommandHandler(["status", "me"], status_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("contact", contact_command))
@@ -2585,8 +3742,8 @@ def main():
     # تحويل الصور وإرسال المستندات
     app.add_handler(CallbackQueryHandler(image_conversion_callback, pattern="^(conv_img_|send_raw_doc_)"))
 
-    # قائمة اختيار نوع الوسائط والدقات
-    app.add_handler(CallbackQueryHandler(media_selection_callback, pattern="^(choose_type_|locked_prem_)"))
+    # قائمة اختيار نوع الوسائط والدقات والترجمة
+    app.add_handler(CallbackQueryHandler(media_selection_callback, pattern="^(choose_type_|locked_prem_|tr_lang_)"))
 
     # أزرار تنزيل الوسائط بالدقة المطلوبة
     app.add_handler(CallbackQueryHandler(download_button_callback, pattern="^(dl_vid_|dl_aud_)"))
